@@ -355,6 +355,16 @@
     },
 
     /** Warms the badge so the first photo of a shift is not slower. */
-    preload: function (src) { return loadBadge(src); }
+    preload: function (src) { return loadBadge(src); },
+
+    /** A smaller copy of a stored photograph (the office board's upload, v59c): the same decoder,
+        scaling and size-ceiling loop as the photos themselves. */
+    shrink: function (blob, maxDimension, ceiling) {
+      return decodeOriented(blob).then(function (source) {
+        var canvas = drawScaled(source, maxDimension);
+        if (source.close) source.close();
+        return compress(canvas, ceiling);
+      });
+    }
   };
 }(window.SA));

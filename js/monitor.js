@@ -1,5 +1,6 @@
 /*
- * Monitor Laporan — the Laporan Tim app's side (installed in superapp-laporan2, v59+).
+ * Monitor Laporan — the Laporan Tim app's side (installed in superapp-laporan2, v59+; needs SA.photo.shrink,
+ * added to js/photo.js in v59c).
  *
  * For every Security / Patrol report the phone SAVES:
  *   1. a small NOTE (no photos, no caption) is queued and posted to the Apps Script -- the board's
@@ -22,16 +23,21 @@ var SA = window.SA || {};
   var URL_ = 'https://script.google.com/macros/s/AKfycbxCeMscffzpDzhQJwnhSHw6lX_VazOT5GL2iyui2rc25N26hCKGskeJcTW6GhniE9uusQ/exec';
   var KEY = 'laporan-tim-monitor-1';          // = WRITE_KEY in the script's properties
   var TEAMS = { security: true, patrol: true };
-  var NOTES = 'ujiMonitorQueue';             // test copy: its own keys (same origin as the real app)
-  var PHOTOS = 'ujiMonitorPhotos';
-  var DEVICE = 'ujiMonitorDevice';
+  /* '' for Laporan Tim itself. A copy published under the same github.io account shares the phone's
+     storage with it, so it needs its own prefix (Sec Prabhu Online: 'uji'); its rows then start 'uji'. */
+  var PREFIX = 'uji';                         // Sec Prabhu Online (same origin as sec-prabhu)
+  function keyOf(name) { return PREFIX ? PREFIX + name.charAt(0).toUpperCase() + name.slice(1) : name; }
+  var NOTES = keyOf('monitorQueue');
+  var PHOTOS = keyOf('monitorPhotos');
+  var DEVICE = keyOf('monitorDevice');
   var BATCH = 50;
   var KEEP_NOTES = 1000;                      // the oldest give way if a phone is offline for weeks
   var KEEP_PHOTOS = 3000;
   var PHOTO_SIZE = 1024;                      // longest side of the uploaded copy
-  var PHOTO_QUALITY = 0.72;
+  var PHOTO_CEILING = 180 * 1024;              // bytes: SA.photo.shrink lowers the quality until it fits
   var PHOTO_DELAY = 90 * 1000;                // after a save: WhatsApp first
-  var MAX_TRIES = 8;                          // a photo that keeps failing is dropped (the report is not)
+  var MAX_TRIES = 8;                          // the SERVER refused it 8 times: dropped (the report is not).
+                                              // A network failure never counts -- weak signal only waits.
 
   function read(key) { try { return JSON.parse(localStorage.getItem(key)) || []; } catch (e) { return []; } }
   function write(key, q, keep) {
@@ -45,7 +51,7 @@ var SA = window.SA || {};
     var id = null;
     try { id = localStorage.getItem(DEVICE); } catch (e) { /* private mode */ }
     if (!id) {
-      id = 'uji' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);   // test copy: rows start 'uji'
+      id = PREFIX + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
       try { localStorage.setItem(DEVICE, id); } catch (e) { /* ignore */ }
     }
     return id;
@@ -97,6 +103,10 @@ var SA = window.SA || {};
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // keeps it a simple request: no preflight
       body: text,
       keepalive: text.length < 60000                              // keepalive bodies are capped at 64 KB
+    }).catch(function (e) {
+      var err = new Error('jaringan: ' + (e && e.message || e));
+      err.network = true;                                         // no answer at all: try again later, never count it
+      throw err;
     }).then(function (res) { return res.json(); });
   }
 
@@ -108,16 +118,20 @@ var SA = window.SA || {};
     var q = read(NOTES);
     if (!q.length) return Promise.resolve(true);
     noteBusy = true;
+    var before = q.length;
     return post({ k: KEY, v: 2, notes: q.slice(0, BATCH) }).then(function (res) {
       if (!res || !res.ok) return false;
       var kept = {};
+      // "saved" also lists notes the server refused as not ours: they leave the queue too, or they
+      // would be sent for ever and hold every photo behind them
       (res.saved || []).forEach(function (id) { kept[id] = true; });
       write(NOTES, read(NOTES).filter(function (n) { return !kept[n.id]; }), KEEP_NOTES);
       return true;
     }).catch(function () { return false; }).then(function (ok) {
       noteBusy = false;
-      if (ok && read(NOTES).length) return flushNotes();
-      return ok && !read(NOTES).length;
+      var left = read(NOTES).length;
+      if (ok && left && left < before) return flushNotes();      // more to send, and progress was made
+      return ok && !left;
     });
   }
 
@@ -126,23 +140,6 @@ var SA = window.SA || {};
   var lastSave = 0;
   var photoBusy = false;
 
-  function smaller(blob) {
-    var load = window.createImageBitmap ? createImageBitmap(blob) : new Promise(function (ok, bad) {
-      var img = new Image();
-      img.onload = function () { ok(img); };
-      img.onerror = bad;
-      img.src = URL.createObjectURL(blob);
-    });
-    return load.then(function (img) {
-      var w = img.width, h = img.height, s = Math.min(1, PHOTO_SIZE / Math.max(w, h));
-      var canvas = document.createElement('canvas');
-      canvas.width = Math.round(w * s);
-      canvas.height = Math.round(h * s);
-      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-      if (img.close) img.close();
-      return new Promise(function (ok) { canvas.toBlob(ok, 'image/jpeg', PHOTO_QUALITY); });
-    });
-  }
   function base64(blob) {
     return new Promise(function (ok, bad) {
       var r = new FileReader();
@@ -166,20 +163,23 @@ var SA = window.SA || {};
     if (Date.now() - lastSave < PHOTO_DELAY) return;
     if (read(NOTES).length) return;                     // notes first, always
     var job = read(PHOTOS)[0];
-    if (!job || !SA.db || !SA.db.bySession) return;
+    if (!job || !SA.db || !SA.db.bySession || !SA.photo || !SA.photo.shrink) return;
     photoBusy = true;
     SA.db.bySession(job.sessionId).then(function (records) {
       var rec = records.filter(function (r) { return r.id === job.recordId; })[0];
       var photo = rec && rec.photos && rec.photos[job.i];
       if (!photo || !photo.blob) { dropJob(job); return 'next'; }   // report deleted on the phone: nothing to send
-      return smaller(photo.blob).then(base64).then(function (data) {
+      return SA.photo.shrink(photo.blob, PHOTO_SIZE, PHOTO_CEILING).then(base64).then(function (data) {
         return post({ k: KEY, v: 1, photo: Object.assign({}, job, { data: data, takenAt: photo.takenAt || '' }) });
       }).then(function (res) {
         if (res && res.ok) { dropJob(job); return 'next'; }
         bumpJob(job);
         return 'stop';
       });
-    }).catch(function () { bumpJob(job); return 'stop'; }).then(function (go) {
+    }).catch(function (err) {
+      if (!(err && err.network)) bumpJob(job);           // a photo that cannot be read or sent counts; no signal does not
+      return 'stop';
+    }).then(function (go) {
       photoBusy = false;
       if (go === 'next') setTimeout(flushPhotos, 1500);
     });
