@@ -62,16 +62,41 @@ var SA = window.SA || {};
       point: r.kind === 'patrol' ? (r.point || r.area || '') : '',
       pass: r.pass || '',
       timestamp: r.timestamp, reporter: r.reporter || '', officers: r.officers || [],
-      build: SA.BUILD || '', device: dev
+      build: SA.BUILD || '', device: dev,
+      report: reportOf(r)
     };
   }
 
+  /* The report as the app's Excel lays it out: that team's sheet for this kind, built by the app's own
+     code for this one record. The server puts it in a tab of the same name, so the Drive sheet reads
+     like the export. Kinds the Excel leaves out (Mulai Shift) send no row. Photo cells are filled by the
+     server with a Drive link when each photo arrives. */
+  var SHEETS = { security: function () { return SA.secRecords; }, patrol: function () { return SA.patrolRecords; } };
+  function reportOf(r) {
+    try {
+      var mod = SHEETS[r.team] && SHEETS[r.team]();
+      if (!mod || !mod.sheets) return null;
+      var s = mod.sheets([r]).filter(function (x) { return x.rows && x.rows.length; })[0];
+      if (!s) return null;
+      var headers = [], cells = [], photoCols = [];
+      s.columns.forEach(function (c, i) {
+        if (c.type === 'index') return;                 // "No": the sheet numbers its own rows
+        headers.push(c.header);
+        var v = s.rows[0].cells[i];
+        cells.push(v == null ? '' : typeof v === 'number' ? v : String(v));
+        if (c.type === 'photo') photoCols.push(c.header);
+      });
+      return { sheet: s.name, headers: headers, cells: cells, photoCols: photoCols };
+    } catch (e) { return null; }                      // never stop the note for the row
+  }
+
   function post(body) {
+    var text = JSON.stringify(body);
     return fetch(URL_, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // keeps it a simple request: no preflight
-      body: JSON.stringify(body),
-      keepalive: body.notes ? true : false                        // keepalive bodies are capped at 64 KB
+      body: text,
+      keepalive: text.length < 60000                              // keepalive bodies are capped at 64 KB
     }).then(function (res) { return res.json(); });
   }
 
@@ -83,7 +108,7 @@ var SA = window.SA || {};
     var q = read(NOTES);
     if (!q.length) return Promise.resolve(true);
     noteBusy = true;
-    return post({ k: KEY, v: 1, notes: q.slice(0, BATCH) }).then(function (res) {
+    return post({ k: KEY, v: 2, notes: q.slice(0, BATCH) }).then(function (res) {
       if (!res || !res.ok) return false;
       var kept = {};
       (res.saved || []).forEach(function (id) { kept[id] = true; });
@@ -176,10 +201,12 @@ var SA = window.SA || {};
         var photos = record.photos || [];
         if (photos.length) {
           var jobs = read(PHOTOS);
+          var rep = n.report || {};
           photos.forEach(function (p, i) {
             jobs.push({ noteId: n.id, sessionId: record.sessionId, recordId: record.id, i: i, n: photos.length,
               team: n.team, kind: n.kind, unit: n.unit, shift: n.shift, shiftDate: n.shiftDate,
-              hour: n.hour, point: n.point, pass: n.pass });
+              hour: n.hour, point: n.point, pass: n.pass,
+              sheet: rep.sheet || '', col: (rep.photoCols || [])[i] || '', code: p.sealCode || '' });
           });
           write(PHOTOS, jobs, KEEP_PHOTOS);
         }
